@@ -10,7 +10,7 @@ import { prisma } from '../lib/prisma';
 import { withAdvisoryLock } from '../lib/advisory-lock';
 import { clopperPearsonUpper } from '../lib/stats';
 import { brier, logLoss, reliability } from './calibration.service';
-import type { Bucket } from './calibration.service';
+import type { Bucket, Sample } from './calibration.service';
 import { config } from '../config';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
@@ -58,6 +58,7 @@ export async function labelReviews(now = new Date()): Promise<number> {
         onChainMarketId: true,
         proposedOutcome: true,
         resolvedAs: true,
+        createdAt: true,
       },
       orderBy: { createdAt: 'asc' },
       take: 500,
@@ -176,12 +177,12 @@ function computeSlice(key: string, rows: LabelledRow[]): EvaluatorSlice {
   );
 
   // Reliability / brier / log-loss: evaluator vs final outcome
-  const reliabilitySamples = eligible
+  const reliabilitySamples: Sample[] = eligible
     .filter((r) => r.independentOutcome !== null && r.confidence > 0)
     .map((r) => ({
       p: r.confidence,
-      outcome: r.independentOutcome === r.finalOutcome ? 1 : 0,
-      weight: 1,
+      o: r.independentOutcome === r.finalOutcome ? 1 : 0,
+      w: 1,
     }));
 
   const nWrongProposals = eligible.filter((r) => r.proposalCorrect === false).length;
@@ -221,10 +222,10 @@ function computeSlice(key: string, rows: LabelledRow[]): EvaluatorSlice {
       ? reliability(reliabilitySamples)
       : [],
     brier: reliabilitySamples.length > 0
-      ? brier(reliabilitySamples.map((s) => ({ p: s.p, outcome: s.outcome, weight: 1 })))
+      ? brier(reliabilitySamples)
       : NaN,
     logLoss: reliabilitySamples.length > 0
-      ? logLoss(reliabilitySamples.map((s) => ({ p: s.p, outcome: s.outcome, weight: 1 })))
+      ? logLoss(reliabilitySamples)
       : NaN,
     falseSilence,
     calibratedThreshold,

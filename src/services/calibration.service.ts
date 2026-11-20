@@ -179,7 +179,7 @@ export function applyShrinkage(p: number, k: number): number {
 // ─── Rows, weighting and slicing ─────────────────────────────────────────────
 
 export type Weighting = 'time' | 'last' | 'first';
-export const GROUP_BYS = ['agentType', 'category', 'decisionType', 'promptVersion', 'model', 'agentType_category'] as const;
+export const GROUP_BYS = ['agentType', 'category', 'decisionType', 'promptVersion', 'model', 'agentType_category', 'sourceWeightSet'] as const;
 export type GroupBy = (typeof GROUP_BYS)[number];
 export const WINDOWS = ['30d', '90d', 'all'] as const;
 export type Window = (typeof WINDOWS)[number];
@@ -201,6 +201,8 @@ export interface TraceRow {
   promptVersion: string | null;
   /** Model of the first provenance entry, or null. */
   model: string | null;
+  /** Source weight set version the trace's evidence was scored with (#223); null before #223. */
+  sourceWeightSetVersion?: number | null;
 }
 
 /**
@@ -221,14 +223,7 @@ export function buildSamples(rows: TraceRow[], weighting: Weighting = 'time'): S
   const out: Sample[] = [];
   for (const list of byMarket.values()) {
     list.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-    let weights: number[];
-    if (weighting === 'last') weights = list.map((_, i) => (i === list.length - 1 ? 1 : 0));
-    else if (weighting === 'first') weights = list.map((_, i) => (i === 0 ? 1 : 0));
-    else {
-      const spans = list.map((r, i) => (list[i + 1]?.createdAt ?? r.resolvedAt).getTime() - r.createdAt.getTime());
-      const total = spans.reduce((a, b) => a + b, 0);
-      weights = spans.map((s) => (total > 0 ? s / total : 1 / list.length));
-    }
+    const weights = marketTraceWeights(list, weighting);
     list.forEach((r, i) => {
       if (weights[i] <= 0) return;
       out.push({
@@ -243,6 +238,19 @@ export function buildSamples(rows: TraceRow[], weighting: Weighting = 'time'): S
   return out;
 }
 
+/**
+ * How one market's total weight of 1 is split between its traces, which must
+ * be sorted by createdAt and precede resolvedAt (see {@link buildSamples}).
+ * Shared with the source-weight estimator (#223).
+ */
+export function marketTraceWeights(list: Array<{ createdAt: Date; resolvedAt: Date }>, weighting: Weighting = 'time'): number[] {
+  if (weighting === 'last') return list.map((_, i) => (i === list.length - 1 ? 1 : 0));
+  if (weighting === 'first') return list.map((_, i) => (i === 0 ? 1 : 0));
+  const spans = list.map((r, i) => (list[i + 1]?.createdAt ?? r.resolvedAt).getTime() - r.createdAt.getTime());
+  const total = spans.reduce((a, b) => a + b, 0);
+  return spans.map((s) => (total > 0 ? s / total : 1 / list.length));
+}
+
 export function sliceKey(r: TraceRow, groupBy: GroupBy): string {
   switch (groupBy) {
     case 'agentType': return r.agentType;
@@ -251,6 +259,8 @@ export function sliceKey(r: TraceRow, groupBy: GroupBy): string {
     case 'promptVersion': return r.promptVersion ?? 'unknown';
     case 'model': return r.model ?? 'unknown';
     case 'agentType_category': return `${r.agentType}:${r.category}`;
+    // #223: traces before learned weights used the compiled table, i.e. v0.
+    case 'sourceWeightSet': return `v${r.sourceWeightSetVersion ?? 0}`;
   }
 }
 
@@ -346,6 +356,7 @@ interface RawRow {
   o: number;
   promptVersion: string | null;
   model: string | null;
+  sourceWeightSetVersion: number | null;
 }
 
 /**
@@ -397,7 +408,8 @@ export async function extractRows(db: Db, since: Date | null): Promise<TraceRow[
                LIMIT 1
              ),
              t."provenance"->'llm'->0->>'model'
-           )                                           AS "model"
+           )                                           AS "model",
+           t."sourceWeightSetVersion"                 AS "sourceWeightSetVersion"
     FROM reasoning_traces t
     JOIN markets m ON m.id = t."marketId"
     WHERE m.status = 'RESOLVED'

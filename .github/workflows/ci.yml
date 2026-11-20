@@ -115,3 +115,20 @@ jobs:
 
       - name: Lint new migrations
         run: npm run lint:migrations
+
+  deploy-artifacts:
+    name: Validate Dockerfile and Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Helm lint (staging and production values)
+        run: |
+          helm lint deploy/helm/oracledesk-backend -f deploy/helm/oracledesk-backend/values-staging.yaml
+          helm lint deploy/helm/oracledesk-backend -f deploy/helm/oracledesk-backend/values-production.yaml
+      - name: Docker build check (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false

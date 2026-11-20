@@ -115,6 +115,11 @@ export function toSignerConfig(spec: Extract<ResolutionSpecJson, { kind: 'signer
 
 export function resolutionSpecScVal(spec: ResolutionSpecJson): xdr.ScVal {
   validateResolutionSpec(spec);
+  // price_scaled and price_twap are not ResolutionSpec variants: they are
+  // hashed on their own under a domain tag (see commitmentHash).
+  if (spec.kind === 'price_scaled' || spec.kind === 'price_twap') {
+    throw new SpecDecodeError(`${spec.kind} has no ResolutionSpec encoding; use commitmentHash`);
+  }
   const [variant, inner] =
     spec.kind === 'price'
       ? ['Price', resolverSpec.nativeToScVal(toPriceConfig(spec), udt('PriceConfig'))]
@@ -268,9 +273,18 @@ export function validateResolutionSpec(spec: ResolutionSpecJson, opts: ValidateR
   if (spec.asset.kind === 'stellar' && !isAddress(spec.asset.address)) throw new Error('asset address is invalid');
   if (spec.asset.kind === 'other' && spec.asset.symbol.length === 0) throw new Error('asset symbol must not be empty');
   if (!/^-?\d+$/.test(spec.threshold)) throw new Error('threshold must be an integer string');
-  // The resolver contract rejects max_staleness == 0 with InvalidConfig, so a
-  // market committed with 0 could never be revealed.
-  if (!Number.isInteger(spec.maxStaleness) || spec.maxStaleness <= 0) throw new Error('maxStaleness must be > 0');
+  if (spec.kind === 'price_twap') {
+    if (!Number.isInteger(spec.window) || spec.window <= 0) throw new Error('window must be > 0');
+    if (!Number.isInteger(spec.minSamples) || spec.minSamples < 1) throw new Error('minSamples must be >= 1');
+    if (!Number.isInteger(spec.maxGap) || spec.maxGap <= 0) throw new Error('maxGap must be > 0');
+  } else {
+    if (spec.kind === 'price_scaled' && (!Number.isInteger(spec.thresholdDecimals) || spec.thresholdDecimals < 0)) {
+      throw new Error('thresholdDecimals must be >= 0');
+    }
+    // The resolver contract rejects max_staleness == 0 with InvalidConfig, so a
+    // market committed with 0 could never be revealed.
+    if (!Number.isInteger(spec.maxStaleness) || spec.maxStaleness <= 0) throw new Error('maxStaleness must be > 0');
+  }
   if (opts.forReveal && BigInt(spec.threshold) < 0n) {
     throw new Error('threshold must be >= 0 to reveal a price spec');
   }

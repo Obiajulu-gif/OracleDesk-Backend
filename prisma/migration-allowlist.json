@@ -108,5 +108,22 @@
     ],
     "reason": "limitPriceBps is bounded to 1..10000 by its CHECK and decisionLedger is a Stellar ledger sequence (u32); both match Prisma Int fields.",
     "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261120110000_outbox_unhandled_index",
+    "rules": [
+      "require-concurrent-index-creation"
+    ],
+    "reason": "chain_transactions holds only outbox rows (one per live write), so the build is short; CREATE INDEX CONCURRENTLY is not allowed inside Prisma's migration transaction, and lock_timeout = 5s bounds the SHARE lock wait (#220).",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261120120000_allowance_day_buckets",
+    "rules": [
+      "adding-foreign-key-constraint",
+      "prefer-timestamptz"
+    ],
+    "reason": "allowance_days and allowance_charges are created empty in this same migration, so their users FKs scan nothing and lock no table anyone else writes to; the timestamp columns are TIMESTAMP(3) to match every other Prisma DateTime column (stored as UTC by the client).",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
   }
 ]

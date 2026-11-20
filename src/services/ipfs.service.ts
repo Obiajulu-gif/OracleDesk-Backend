@@ -9,6 +9,9 @@ import { AppError } from '../middlewares/error.middleware';
 import type { z } from 'zod';
 import { assertPlainJson, canonicalBytes, canonicalBytesStrict, NonPlainJsonError, sha256Hex } from '../utils/hash.util';
 import { getContentStore } from './content-store.service';
+import { prisma } from '../lib/prisma';
+import { configuredPinProviders } from './ipfs/providers';
+import { fetchVerified } from './ipfs/gateways';
 import { bulkheads, deadline, sleep, TimeoutError } from '../lib/resilience';
 
 const PINATA_BASE = 'https://api.pinata.cloud';
@@ -173,9 +176,34 @@ export interface PinnedDocument {
   /** sha256 hex of the exact bytes pinned. */
   hash: string;
   bytes: Buffer;
+  /** Per-provider replication status recorded at pin time (#271). */
+  replicas?: Record<string, 'PINNED' | 'PENDING'>;
 }
 
-/** Canonicalises `document`, pins those bytes and returns their hash. Retries once. */
+async function persistPinState(cid: string, provider: string, state: 'PINNED' | 'PENDING', lastError?: string): Promise<void> {
+  try {
+    await (prisma as any).ipfsPin?.upsert?.({
+      where: { cid_provider: { cid, provider } },
+      create: {
+        cid,
+        provider,
+        state,
+        pinnedAt: state === 'PINNED' ? new Date() : null,
+        lastCheckedAt: new Date(),
+        lastError: lastError ?? null,
+      },
+      update: {
+        state,
+        ...(state === 'PINNED' ? { pinnedAt: new Date(), lastError: null } : { lastError: lastError ?? null }),
+        lastCheckedAt: new Date(),
+      },
+    });
+  } catch {
+    // Best-effort persistence when DB is unavailable in unit tests.
+  }
+}
+
+/** Canonicalises `document`, enforces single-block size, verifies CID, pins across providers and returns its hash. */
 export async function pinJson(
   document: unknown,
   name: string,
@@ -190,10 +218,20 @@ export async function pinJson(
     throw err;
   }
   const bytes = canonicalBytes(document);
+  if (bytes.length > config.IPFS_SINGLE_BLOCK_MAX) {
+    throw new AppError(413, 'IPFS_DOCUMENT_TOO_LARGE', 'Canonical JSON document exceeds single-block IPFS limit', {
+      name,
+      size: bytes.length,
+      max: config.IPFS_SINGLE_BLOCK_MAX,
+    });
+  }
   const hash = sha256Hex(bytes);
+  const expectedCid = cidForBytes(bytes);
   let lastError: unknown;
 
   const handle = deadline('ipfs-pin', opts?.signal);
+  const providers = configuredPinProviders();
+  const useCustomTransport = transport !== defaultTransport || config.IPFS_TRANSPORT === 'local';
 
   try {
     return await bulkheads['ipfs-pin'].run(async () => {
@@ -203,7 +241,45 @@ export async function pinJson(
         }
 
         try {
-          const cid = await transport.pin(bytes, name, handle.signal);
+          const primary = providers[0]!;
+          const cid = useCustomTransport
+            ? await transport.pin(bytes, name, handle.signal)
+            : await primary.pin(bytes, name, handle.signal, expectedCid);
+
+          if (!useCustomTransport && cid !== expectedCid) {
+            throw new AppError(502, 'IPFS_CID_MISMATCH', `Provider ${primary.name} returned mismatched CID`, {
+              expectedCid,
+              returnedCid: cid,
+              provider: primary.name,
+            });
+          }
+
+          const replicas: Record<string, 'PINNED' | 'PENDING'> = { [primary.name]: 'PINNED' };
+          await persistPinState(cid, primary.name, 'PINNED');
+
+          for (const secondary of providers.slice(1)) {
+            replicas[secondary.name] = 'PENDING';
+            await persistPinState(cid, secondary.name, 'PENDING');
+            if (!handle.signal.aborted) {
+              try {
+                const secCid = await secondary.pin(bytes, name, handle.signal, cid);
+                if (secCid !== cid) {
+                  throw new AppError(502, 'IPFS_CID_MISMATCH', `Secondary provider ${secondary.name} returned mismatched CID`, {
+                    expectedCid: cid,
+                    returnedCid: secCid,
+                    provider: secondary.name,
+                  });
+                }
+                replicas[secondary.name] = 'PINNED';
+                await persistPinState(cid, secondary.name, 'PINNED');
+              } catch (secErr) {
+                if (secErr instanceof AppError && secErr.code === 'IPFS_CID_MISMATCH') throw secErr;
+                logger.warn({ err: secErr, cid, provider: secondary.name }, 'Secondary IPFS pin failed; left PENDING for repair job');
+                await persistPinState(cid, secondary.name, 'PENDING', secErr instanceof Error ? secErr.message : String(secErr));
+              }
+            }
+          }
+
           // Write-through: the pin succeeded, so a cache failure must not fail
           // the caller (the CID/hash are still returned and persisted).
           await getContentStore()
@@ -211,14 +287,14 @@ export async function pinJson(
             .catch((err: unknown) => {
               logger.warn({ err, cid, name }, 'IPFS content store write failed; continuing');
             });
-          logger.info({ name, cid, hash }, 'Pinned to IPFS');
-          return { cid, hash, bytes };
+          logger.info({ name, cid, hash, replicas }, 'Pinned to IPFS');
+          return { cid, hash, bytes, replicas };
         } catch (err) {
           lastError = err;
           if (opts?.signal?.aborted || handle.signal.aborted) {
             throw (opts?.signal?.reason ?? handle.signal.reason);
           }
-          if (err instanceof AppError && err.code === 'IPFS_NOT_CONFIGURED') break;
+          if (err instanceof AppError && (err.code === 'IPFS_NOT_CONFIGURED' || err.code === 'IPFS_CID_MISMATCH')) break;
           if (attempt === 1) {
             logger.warn({ name }, 'IPFS pin failed, retrying in 3s');
             await sleep(3000, handle.signal);
@@ -274,9 +350,21 @@ export async function pinDocument<T extends z.ZodTypeAny>(
   }
 }
 
-export function fetchIpfsBytes(cid: string, signal?: AbortSignal): Promise<Buffer> {
+export function fetchIpfsBytes(
+  cid: string,
+  signal?: AbortSignal,
+  opts?: { maxBytes?: number; expectedSha256?: string },
+): Promise<Buffer> {
   return bulkheads['ipfs-fetch'].run(async () => {
     try {
+      if (transport === pinataTransport) {
+        const { bytes } = await fetchVerified(cid, {
+          signal,
+          maxBytes: opts?.maxBytes,
+          expectedSha256: opts?.expectedSha256,
+        });
+        return bytes;
+      }
       return await transport.fetch(cid, signal);
     } catch (err) {
       if (err instanceof AppError && err.code === 'IPFS_RETRIEVAL_FAILED') {
@@ -294,13 +382,14 @@ export function fetchIpfsBytes(cid: string, signal?: AbortSignal): Promise<Buffe
  * Returns bytes for `cid` only if they match `expectedSha256` (the on-chain
  * hash or the hash computed at pin time). Cache hits are re-hashed on read;
  * a cached row with a different hash is ignored and never served. Gateway
- * bytes are stored only after they verify. Bytes that fail verification are
- * still returned (so callers can report `verified: false`) but never cached.
+ * fetches run inside the `ipfs-fetch` bulkhead with hedged health-scored
+ * gateways and enforce `maxBytes` (#271).
  */
 export async function fetchVerifiedBytes(
   cid: string,
   expectedSha256: string,
   verifiedBy: string,
+  opts?: { signal?: AbortSignal; maxBytes?: number },
 ): Promise<{ bytes: Buffer; source: 'cache' | 'gateway' }> {
   const expected = expectedSha256.toLowerCase().replace(/^0x/, '');
   const store = getContentStore();
@@ -318,7 +407,10 @@ export async function fetchVerifiedBytes(
     );
   }
 
-  const bytes = await transport.fetch(cid);
+  const bytes = await fetchIpfsBytes(cid, opts?.signal, {
+    maxBytes: opts?.maxBytes,
+    expectedSha256: expected,
+  });
   const matches = sha256Hex(bytes) === expected;
   if (matches && bytes.length <= config.IPFS_CACHE_MAX_OBJECT_BYTES) {
     await store

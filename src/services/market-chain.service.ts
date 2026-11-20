@@ -54,13 +54,30 @@ export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcom
   if (!marketId) return;
 
   if (outcome.status !== 'SUCCESS') {
-    await writeAgentLog({
-      agentType: 'MARKET_MAKER',
-      level: 'ERROR',
-      action: 'MARKET_CREATION_FAILED',
-      marketId,
-      data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
-    }).catch(() => undefined);
+    // One log per outbox row (#229): a crash between this handler and
+    // markHandled re-runs it, and concurrent recoverers can both pick the
+    // unhandled row. The advisory lock serialises them; the lookup skips a
+    // log an earlier run already wrote.
+    await prisma
+      .$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${`market.create:${row.id}`}))`;
+        const existing = await tx.agentLog.findFirst({
+          where: { action: 'MARKET_CREATION_FAILED', marketId, data: { path: ['outboxId'], equals: row.id } },
+          select: { id: true },
+        });
+        if (existing) return;
+        await writeAgentLog(
+          {
+            agentType: 'MARKET_MAKER',
+            level: 'ERROR',
+            action: 'MARKET_CREATION_FAILED',
+            marketId,
+            data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
+          },
+          tx,
+        );
+      })
+      .catch((err) => logger.warn({ err, outboxId: row.id }, 'market.create: could not record the failure log'));
     return;
   }
 
@@ -329,8 +346,8 @@ export async function createMarketOnChain(
     data: {
       resolutionSpec: spec as object,
       resolutionHash: resolutionHashHex,
-      questionHash,
-      metaUri,
+      questionHash: pinned.hash,
+      metaUri: `ipfs://${pinned.cid}`,
       seedAmountRaw: seed.toString(),
     },
   });

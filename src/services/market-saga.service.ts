@@ -189,6 +189,8 @@ const STEPS: Partial<Record<GenerationRunState, StepFn>> = {
         proposalProvenance: provenance,
         groundingSignalIds: groundingSignals.map((s: any) => s.id ?? null),
         evidence,
+        // #223: the weight set that scored `evidence`, recorded in the trace.
+        sourceWeightSet: signals.weightSet ?? null,
       },
       next: 'PROPOSED',
     };
@@ -241,6 +243,15 @@ const STEPS: Partial<Record<GenerationRunState, StepFn>> = {
       }).catch(() => {});
       return skip('DUPLICATE', { dedup: { reason: reservation.reason, match: reservation.match ?? null } });
     }
+
+    const market = await prisma.$transaction(async (tx) => {
+      const created = await createMarketFromProposal(proposal, undefined, undefined, tx);
+      await tx.marketGenerationRun.update({
+        where: { id: ctx.run.id },
+        data: { marketId: created.id },
+      });
+      return created;
+    });
 
     return {
       outputs: {
@@ -373,7 +384,7 @@ const STEPS: Partial<Record<GenerationRunState, StepFn>> = {
   CHAIN_CONFIRMED: async (ctx) => {
     if (ctx.outputs.traceId) return { next: 'TRACE_PERSISTED' };
     const market = await loadMarket(ctx);
-    const { proposal, seedDecision, seedPolicy, evidence, proposalProvenance } = ctx.outputs;
+    const { proposal, seedDecision, seedPolicy, evidence, proposalProvenance, sourceWeightSet } = ctx.outputs;
     const { trace, tracePayload } = await generateReasoningTrace(
       {
         marketId: market.id,
@@ -385,6 +396,7 @@ const STEPS: Partial<Record<GenerationRunState, StepFn>> = {
         edge: proposal.initial_yes_probability - seedDecision.pAdj,
         confidenceInterval: proposal.confidence_interval,
         seedPolicy,
+        sourceWeightSet: sourceWeightSet ?? undefined,
       } as any,
       { purpose: ctx.priority === 'admin' ? 'admin_trace_hedge' : 'trace_hedge', priority: ctx.priority },
       { upstreamProvenance: proposalProvenance ? [proposalProvenance] : [] },
@@ -392,7 +404,8 @@ const STEPS: Partial<Record<GenerationRunState, StepFn>> = {
     return {
       outputs: {
         traceId: trace.id,
-        tracePayload: jsonSafe({ ...tracePayload, onChainMarketId: ctx.outputs.onChainMarketId ?? null }),
+        // The validated document, unchanged (#227); publish_trace carries the market id.
+        tracePayload: jsonSafe(tracePayload),
       },
       next: 'TRACE_PERSISTED',
     };

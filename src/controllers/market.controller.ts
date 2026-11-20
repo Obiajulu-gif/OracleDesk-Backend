@@ -22,6 +22,7 @@ import {
 } from '@prisma/client';
 import { AppError } from '../middlewares/error.middleware';
 import { assertAgentActive } from '../services/agent-controls.service';
+import { freshnessMeta } from '../lib/freshness';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
@@ -140,7 +141,10 @@ export async function listMarkets(
     res,
     markets.map(serializeMarket),
     200,
-    buildPaginationMeta(page, limit, total) as any,
+    { ...(buildPaginationMeta(page, limit, total) as any), ...(await freshnessMeta(
+      'indexed',
+      markets.reduce<number | null>((min, market) => market.chainSyncedLedger === null ? min : min === null ? market.chainSyncedLedger : Math.min(min, market.chainSyncedLedger), null),
+    )) },
   );
 }
 
@@ -168,7 +172,7 @@ export async function getMarket(
     return;
   }
 
-  sendSuccess(res, serializeMarket(market));
+  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**
@@ -187,7 +191,7 @@ export async function getMarketByOnChainId(req: Request, res: Response): Promise
     sendError(res, 404, 'MARKET_NOT_FOUND', `No backend market for on-chain id ${raw}`);
     return;
   }
-  sendSuccess(res, serializeMarket(market));
+  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**
@@ -426,5 +430,5 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     source: 'chain',
     ledger: result.ledger,
     cached: result.cached,
-  });
+  }, 200, await freshnessMeta(result.cached ? 'chain-cache' : 'rpc', result.ledger));
 }

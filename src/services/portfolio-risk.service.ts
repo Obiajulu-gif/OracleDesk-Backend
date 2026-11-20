@@ -22,13 +22,13 @@ import { hashSeed, gaussian, mulberry32 } from '../backtest/rng';
 // Config
 // ---------------------------------------------------------------------------
 
-const RISK_MC_PATHS       = Number(config.RISK_MC_PATHS       ?? 20_000);
-const RISK_MAX_MARKETS    = Number(config.RISK_MAX_MARKETS    ?? 150);
-const RISK_RHO_SHRINK     = Number(config.RISK_RHO_SHRINK     ?? 0.8);
-const RISK_MAX_DURATION_MS = Number(config.RISK_MAX_DURATION_MS ?? 10_000);
+const RISK_MC_PATHS        = config.RISK_MC_PATHS;
+const RISK_MAX_MARKETS     = config.RISK_MAX_MARKETS;
+const RISK_RHO_SHRINK      = config.RISK_RHO_SHRINK;
+const RISK_MAX_DURATION_MS = config.RISK_MAX_DURATION_MS;
 
-export const RISK_GATE_ENABLED = config.RISK_GATE_ENABLED === 'true';
-export const RISK_MAX_ES_BPS   = Number(config.RISK_MAX_ES_BPS ?? 500);
+export const RISK_GATE_ENABLED = config.RISK_GATE_ENABLED;
+export const RISK_MAX_ES_BPS   = config.RISK_MAX_ES_BPS;
 
 // ---------------------------------------------------------------------------
 // Types

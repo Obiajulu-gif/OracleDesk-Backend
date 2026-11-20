@@ -59,7 +59,7 @@ class ScriptedRpcDouble {
     if (status === 'TIMEOUT') throw new Error('RPC timeout');
     return {
       status,
-      hash,
+      txHash: hash,
       envelopeXdr: entry.envelopeXdr,
       ledger: entry.ledger,
       resultMetaXdr: undefined,
@@ -208,7 +208,7 @@ describe('Payment fault-injection — P scenarios', () => {
       const r2 = await reader.getTransaction('hash-p6');
       assert.equal(r1.status, 'SUCCESS');
       assert.equal(r2.status, 'SUCCESS');
-      assert.equal(r1.hash, r2.hash, 'both calls refer to the same transaction'); // I4
+      assert.equal(r1.txHash, r2.txHash, 'both calls refer to the same transaction'); // I4
     });
   });
 

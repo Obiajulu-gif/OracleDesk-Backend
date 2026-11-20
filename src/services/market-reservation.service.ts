@@ -7,7 +7,7 @@
  * embedding calls or chain I/O.
  */
 import { createHash } from 'crypto';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { withAdvisoryLockWait } from '../lib/advisory-lock';
 import { config } from '../config';
@@ -148,7 +148,7 @@ export async function reserveProposal(input: ReserveInput): Promise<ReserveResul
           category: normalizeCategory(proposal.category) as any,
           expiryTimestamp: expiry,
           embeddingModel: vector?.model ?? null,
-          embeddingVector: vector ? (vector.values as unknown as Prisma.JsonArray) : null,
+          embeddingVector: vector ? vector.values : Prisma.DbNull,
           status: 'HELD',
           leaseUntil,
         },
@@ -216,9 +216,6 @@ async function checkCommitted(
   expiry: Date,
   vector: ReserveInput['vector'] | undefined,
 ): Promise<CommittedMatch | null> {
-  const expiry_ts = proposal.expiry_timestamp;
-  const normalised = normalizeQuestion(proposal.market_question);
-  _ = normalised; // used by embedding caller upstream; kept here for parity
 
   const active = await prisma.market.findMany({
     where: { status: { in: ['PENDING', 'ACTIVE'] } },
@@ -244,6 +241,3 @@ async function checkCommitted(
 function normalizeCategory(raw: string): string {
   return raw.toUpperCase();
 }
-
-// suppress unused-variable error for `normalised` reference kept for clarity
-declare const _: unknown;

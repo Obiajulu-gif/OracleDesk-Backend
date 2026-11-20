@@ -141,8 +141,8 @@ export async function verifyTraceOnChain(
     verified,
     contentSource: source,
     verifiedAt: new Date(),
-    contentMode,
-    plaintextHash,
+    contentMode: trace.contentMode,
+    plaintextHash: trace.plaintextHash,
   };
 }
 

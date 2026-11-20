@@ -11,7 +11,20 @@ import path from 'path';
  * rewrites `$id` from `PUBLIC_API_BASE_URL` on each request.
  */
 
-const SCHEMAS_DIR = path.join(__dirname);
+/**
+ * The committed files live in <repo>/src/schemas. This module also runs
+ * compiled from dist/ and dist-tests/, so the repo root is found by walking up
+ * to package.json rather than assumed to be next to __dirname.
+ */
+function schemasDir(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i++) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return path.join(dir, 'src', 'schemas');
+    dir = path.dirname(dir);
+  }
+  return __dirname;
+}
+const SCHEMAS_DIR = schemasDir();
 const CANONICAL_BASE = 'https://api.oracledesk.io';
 
 export const TRACE_V1_SCHEMA = {
@@ -52,7 +65,7 @@ export const TRACE_V1_SCHEMA = {
       required: ['backendId', 'onChainId'],
       properties: {
         backendId: { type: 'string', format: 'uuid' },
-        onChainId: { type: ['string', 'null'], pattern: '^\\d+$' },
+        onChainId: { type: ['string', 'null'], pattern: '^[0-9]+$' },
       },
     },
     probabilityEstimate: { type: 'number', minimum: 0, maximum: 1 },
@@ -60,6 +73,7 @@ export const TRACE_V1_SCHEMA = {
     edge: { type: 'number', minimum: -1, maximum: 1 },
     confidenceInterval: {
       type: 'object',
+      description: 'lower must be <= upper',
       additionalProperties: false,
       required: ['lower', 'upper'],
       properties: {
@@ -86,10 +100,145 @@ export const TRACE_V1_SCHEMA = {
     betSizeUsdc: { type: ['number', 'null'] },
     hedgeConditions: {
       type: 'array',
+      maxItems: 20,
       items: { type: 'string', maxLength: 500 },
     },
     agentWallet: { type: ['string', 'null'] },
     createdAt: { type: 'string', format: 'date-time' },
+  },
+};
+
+const PROVENANCE_ENTRY_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: [
+        'source', 'provider', 'model', 'promptId', 'promptVersion', 'promptHash',
+        'params', 'usage', 'latencyMs', 'attempts', 'outputSha256',
+      ],
+      properties: {
+        source: { const: 'llm' },
+        provider: { type: 'string', enum: ['anthropic', 'gemini'] },
+        model: { type: 'string' },
+        promptId: { type: 'string' },
+        promptVersion: { type: 'integer' },
+        promptHash: { type: 'string' },
+        params: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['temperature', 'maxTokens'],
+          properties: { temperature: { type: 'number' }, maxTokens: { type: 'integer' } },
+        },
+        usage: {
+          type: ['object', 'null'],
+          additionalProperties: false,
+          required: ['inputTokens', 'outputTokens'],
+          properties: { inputTokens: { type: 'integer' }, outputTokens: { type: 'integer' } },
+        },
+        latencyMs: { type: 'number' },
+        attempts: { type: 'integer' },
+        fallbackFrom: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['provider', 'model', 'errorClass'],
+          properties: {
+            provider: { type: 'string', enum: ['anthropic', 'gemini'] },
+            model: { type: 'string' },
+            errorClass: { type: 'string' },
+          },
+        },
+        outputSha256: { type: 'string' },
+      },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['source', 'promptId', 'promptVersion', 'reason'],
+      properties: {
+        source: { const: 'default' },
+        promptId: { type: 'string' },
+        promptVersion: { type: 'integer' },
+        reason: { type: 'string', enum: ['LLM_FAILED', 'LLM_BUDGET_EXCEEDED'] },
+      },
+    },
+  ],
+};
+
+/**
+ * Trace v2 (#227): v1 plus provenance, forecast, sizing, seed policy,
+ * correlation and full evidence. Every added key is required (null when not
+ * applicable), matching the explicit-null rule in docs/trace-format.md §2.
+ */
+export const TRACE_V2_SCHEMA = {
+  ...TRACE_V1_SCHEMA,
+  $id: `${CANONICAL_BASE}/api/v1/schemas/trace/v2.json`,
+  title: 'OracleDesk Reasoning Trace v2',
+  required: [...TRACE_V1_SCHEMA.required, 'provenance', 'forecast', 'sizing', 'seedPolicy', 'correlation', 'corroboration'],
+  properties: {
+    ...TRACE_V1_SCHEMA.properties,
+    schemaVersion: { const: 2 },
+    sourcesUsed: {
+      type: 'array',
+      maxItems: 50,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['source', 'weight', 'signal', 'rawValue', 'signalId', 'url', 'publisher', 'publishedAt'],
+        properties: {
+          source: { type: 'string' },
+          weight: { type: 'number', minimum: 0, maximum: 1 },
+          signal: { type: 'string' },
+          rawValue: { type: ['number', 'null'] },
+          signalId: { type: ['string', 'null'] },
+          url: { type: ['string', 'null'], format: 'uri' },
+          publisher: { type: ['string', 'null'] },
+          publishedAt: { type: ['string', 'null'], format: 'date-time' },
+        },
+      },
+    },
+    provenance: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['schema', 'llm', 'generator'],
+      properties: {
+        schema: { const: 'oracledesk.trace.provenance/1' },
+        llm: { type: 'array', minItems: 1, items: PROVENANCE_ENTRY_SCHEMA },
+        generator: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['service', 'version'],
+          properties: {
+            service: { const: 'oracledesk-backend' },
+            version: { type: 'string' },
+            commit: { type: 'string' },
+          },
+        },
+      },
+    },
+    forecast: { type: ['object', 'null'] },
+    sizing: { type: ['object', 'null'] },
+    seedPolicy: { type: ['object', 'null'] },
+    correlation: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      required: ['pairs', 'method', 'snapshotId'],
+      properties: {
+        pairs: { type: 'array' },
+        method: { type: 'string', enum: ['snapshot', 'matrix'] },
+        snapshotId: { type: ['string', 'null'] },
+      },
+    },
+    corroboration: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      required: ['kind', 'units', 'domains'],
+      properties: {
+        kind: { type: 'string', enum: ['CORROBORATED', 'AUTHORITATIVE', 'UNCORROBORATED'] },
+        units: { type: 'integer', minimum: 0 },
+        domains: { type: 'array', maxItems: 50, items: { type: 'string' } },
+      },
+    },
   },
 };
 
@@ -184,6 +333,7 @@ export interface SchemaTarget {
 
 export const SCHEMA_TARGETS: SchemaTarget[] = [
   { file: 'trace.schema.json', path: 'trace/v1.json', schema: TRACE_V1_SCHEMA, title: 'Reasoning Trace v1' },
+  { file: 'trace-v2.schema.json', path: 'trace/v2.json', schema: TRACE_V2_SCHEMA, title: 'Reasoning Trace v2' },
   { file: 'question.schema.json', path: 'question/v2.json', schema: QUESTION_V2_SCHEMA, title: 'Question v2' },
   { file: 'question-v1.schema.json', path: 'question/v1.json', schema: QUESTION_V1_SCHEMA, title: 'Question v1' },
 ];

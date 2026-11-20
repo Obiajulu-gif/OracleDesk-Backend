@@ -118,7 +118,7 @@ function defaultSettings(): GuardSettings {
     tokenBudget: config.LLM_DAILY_TOKEN_BUDGET,
     costBudgetMicros: config.LLM_DAILY_COST_BUDGET_MICROS,
     reservePct: config.LLM_ADMIN_RESERVE_PCT,
-    rpm: { anthropic: config.LLM_ANTHROPIC_RPM, gemini: config.LLM_GEMINI_RPM },
+    rpm: { anthropic: config.LLM_ANTHROPIC_RPM, gemini: config.LLM_GEMINI_RPM, openai: config.LLM_OPENAI_RPM },
     failureThreshold: config.LLM_BREAKER_FAILURE_THRESHOLD,
     openMs: config.LLM_BREAKER_OPEN_MS,
     failMode: config.LLM_REDIS_FAIL_MODE,
@@ -128,12 +128,16 @@ function defaultSettings(): GuardSettings {
   };
 }
 
-let overrides: Partial<GuardSettings> = {};
+/** `rpm` may name only some providers; the rest keep their configured rate. */
+export type GuardSettingsOverride = Partial<Omit<GuardSettings, 'rpm'>> & { rpm?: Partial<Record<Provider, number>> };
+
+let overrides: GuardSettingsOverride = {};
 export function settings(): GuardSettings {
-  return { ...defaultSettings(), ...overrides };
+  const base = defaultSettings();
+  return { ...base, ...overrides, rpm: { ...base.rpm, ...overrides.rpm } };
 }
 /** Test seam. Pass `{}` to restore config-derived settings. */
-export function setLlmGuardSettings(next: Partial<GuardSettings>): void {
+export function setLlmGuardSettings(next: GuardSettingsOverride): void {
   overrides = next;
 }
 

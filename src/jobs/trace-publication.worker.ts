@@ -4,7 +4,10 @@
  * Drives every `trace_publications` row through
  *   AWAITING_PIN → AWAITING_MARKET → READY → SUBMITTED → CONFIRMED  (or FAILED)
  *
- * - AWAITING_PIN:    pin the stored payload; the pinned bytes define traceHash.
+ * - AWAITING_PIN:    validate, then pin the stored payload; the pinned bytes
+ *                    define traceHash. A v2 document (#227) that fails its
+ *                    schema, or names an on-chain market other than the
+ *                    trace's, fails the row. Legacy payloads pin unchanged.
  * - AWAITING_MARKET: wait until the market has an on-chain id (voided → FAILED).
  * - READY:           make sure the hash isn't already on-chain (trace row link,
  *                    then the registry's per-market index), then publish once.
@@ -28,6 +31,7 @@ import { ChainError } from '../services/stellar/errors';
 import { AgentPausedError } from '../services/agent-controls.service';
 import { agentSigner } from '../services/stellar/clients';
 import { defaultRegistryReader, type RegistryReader } from '../services/trace-audit.service';
+import { TraceDocAny, TraceDocV2 } from '../schemas/trace';
 
 const S = TracePublicationStatus;
 
@@ -221,6 +225,36 @@ async function findOnChainDuplicate(ctx: Ctx, marketId: bigint, traceHash: strin
   return null;
 }
 
+/**
+ * Payload checks (#227). Returns an error code, or null when the payload may
+ * be pinned/published. Only documents that declare schemaVersion 2 are held
+ * to the v2 schema: v1 and legacy payloads already enqueued keep pinning
+ * byte-for-byte as stored.
+ */
+export function payloadError(
+  payload: unknown,
+  traceId: string,
+  marketOnChainId: bigint | null | undefined,
+): 'TRACE_PAYLOAD_INVALID' | 'TRACE_MARKET_MISMATCH' | null {
+  if (!TraceDocAny.safeParse(payload).success) return 'TRACE_PAYLOAD_INVALID';
+  if ((payload as { schemaVersion?: unknown }).schemaVersion !== 2) return null;
+  const v2 = TraceDocV2.safeParse(payload);
+  if (!v2.success || v2.data.traceId !== traceId) return 'TRACE_PAYLOAD_INVALID';
+  // market.onChainId is what the decision knew. Once the market row has an
+  // id, a different one means the trace would land under the wrong market.
+  const claimed = v2.data.market.onChainId;
+  if (claimed !== null && marketOnChainId != null && claimed !== marketOnChainId.toString()) {
+    return 'TRACE_MARKET_MISMATCH';
+  }
+  return null;
+}
+
+async function failPayload(ctx: Ctx, row: PublicationRow, code: string): Promise<Advance> {
+  await update(ctx, row.id, { status: S.FAILED, lastError: code });
+  logger.error({ traceId: row.traceId, code }, 'Trace publication rejected: payload check failed');
+  return { row: { status: S.FAILED }, park: true };
+}
+
 async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
   switch (row.status) {
     case S.AWAITING_PIN: {
@@ -233,6 +267,9 @@ async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
         await update(ctx, row.id, { status: S.FAILED, lastError: 'NO_PAYLOAD' });
         return { row: { status: S.FAILED }, park: true };
       }
+      const owner = await loadTrace(ctx, row.traceId);
+      const bad = payloadError(row.payload, row.traceId, owner?.market?.onChainMarketId);
+      if (bad) return failPayload(ctx, row, bad);
       try {
         const pinned = await ctx.pin(row.payload as Record<string, unknown>, `oracledesk-trace-${row.traceId}`);
         await ctx.prisma.reasoningTrace.update({
@@ -275,6 +312,10 @@ async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
       if (!trace?.traceHash || !trace.ipfsCid || trace.market?.onChainMarketId == null) {
         await update(ctx, row.id, { status: S.AWAITING_MARKET });
         return { row: { status: S.AWAITING_MARKET }, park: false };
+      }
+      if (row.payload != null) {
+        const bad = payloadError(row.payload, row.traceId, trace.market.onChainMarketId);
+        if (bad) return failPayload(ctx, row, bad);
       }
       if (!ctx.dryRun) {
         // Never publish a hash twice: trust the indexer link first, then chain state.

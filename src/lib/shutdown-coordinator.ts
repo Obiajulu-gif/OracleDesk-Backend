@@ -6,7 +6,6 @@
  * release-leases and close-transports stages always get their slice.
  */
 import { logger } from './logger';
-import { withTimeout } from './resilience';
 
 export type Stage =
   | 'stop-intake'
@@ -41,6 +40,22 @@ export interface StepResult {
 export interface ShutdownReport {
   totalMs: number;
   steps: StepResult[];
+}
+
+class StepTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`step exceeded its ${ms}ms budget`);
+    this.name = 'StepTimeoutError';
+  }
+}
+
+/** Settle with `p`, or reject with StepTimeoutError after `ms`. The step itself is not cancelled. */
+function withinBudget<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new StepTimeoutError(ms)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
 const steps: StepDef[] = [];
@@ -89,11 +104,11 @@ export async function runShutdown(totalBudgetMs: number): Promise<ShutdownReport
       stageSteps.map(async (step) => {
         const stepStart = Date.now();
         try {
-          await withTimeout(step.fn(ac.signal), Math.min(step.budgetMs, remaining));
+          await withinBudget(step.fn(ac.signal), Math.min(step.budgetMs, remaining));
           results.push({ name: step.name, stage, durationMs: Date.now() - stepStart, outcome: 'ok' });
         } catch (err) {
           const durationMs = Date.now() - stepStart;
-          const isTimeout = durationMs >= step.budgetMs - 50;
+          const isTimeout = err instanceof StepTimeoutError;
           results.push({
             name: step.name,
             stage,

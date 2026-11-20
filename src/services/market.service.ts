@@ -359,13 +359,15 @@ export async function createMarketFromProposal(
   provenance?: LlmProvenance,
   resolutionDetails?: QuestionResolutionBlock | null,
   tx?: Prisma.TransactionClient,
+  /** Corroboration verdict (#228); stored as Market.corroboration. */
+  corroboration?: Record<string, unknown> | null,
 ): Promise<Market> {
   const finalCategory = normalizeCategory(proposal.category);
   // Callers that persist the market together with other rows (the saga run,
   // the dedup reservation) pass their transaction client.
   const client = tx ?? prisma;
 
-  const market = await client.market.create({
+  const market = await (tx ?? prisma).market.create({
     data: {
       question:           proposal.market_question,
       category:           finalCategory,
@@ -379,6 +381,7 @@ export async function createMarketFromProposal(
       minimumLiquidity:   proposal.minimum_liquidity_usdc,
       ...(resolutionDetails ? { resolutionDetails: resolutionDetails as unknown as Prisma.InputJsonValue } : {}),
       ...(provenance ? { generationProvenance: provenance as unknown as Prisma.InputJsonValue } : {}),
+      ...(corroboration ? { corroboration: corroboration as Prisma.InputJsonValue } : {}),
     },
   });
 

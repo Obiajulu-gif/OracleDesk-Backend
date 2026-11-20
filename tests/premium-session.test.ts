@@ -86,16 +86,13 @@ const stubPrisma = {
   $transaction: async (fn: any) => fn(stubPrisma),
 };
 
-// Patch prisma module
-import { createRequire } from 'node:module';
-const req = createRequire(import.meta.url);
-const prismaLib = req('../src/lib/prisma');
+// Patch prisma module (tests compile to CommonJS, so `require` is the live module object)
+const prismaLib = require('../src/lib/prisma');
 const originalPrisma = prismaLib.prisma;
 Object.assign(prismaLib, { prisma: stubPrisma });
 
 // Patch advisory lock to run inline
-import { createRequire as cr2 } from 'node:module';
-const lockLib = cr2(import.meta.url)('../src/lib/advisory-lock');
+const lockLib = require('../src/lib/advisory-lock');
 const originalLock = lockLib.withAdvisoryLock;
 Object.assign(lockLib, {
   withAdvisoryLock: async (_key: string, fn: (tx: any) => Promise<any>) => {
@@ -204,7 +201,7 @@ describe('premium device registry', () => {
     usageRows.set('u6:' + day, { userId: 'u6', day, keyReleases: 50, premiumReads: 0, distinctIpPrefixes: 0, devicesEvicted: 0 });
 
     // The service reads from config; set a low limit by patching config
-    const cfgModule = req('../src/config');
+    const cfgModule = require('../src/config');
     const original = cfgModule.config.PREMIUM_DAILY_KEY_RELEASE_LIMIT;
     cfgModule.config.PREMIUM_DAILY_KEY_RELEASE_LIMIT = 50;
     try {

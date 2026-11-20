@@ -78,8 +78,10 @@ export function binaryRule(question: string): { pass: boolean; reasons: string[]
  * (#240); this type is compatible with both v1 and that extension.
  */
 export interface JudgeVerdict {
-  binary: 0 | 1;
-  verifiable: 0 | 1;
+  /** 0 or 1. Typed as number so zod's `z.number().int().min(0).max(1)` output fits. */
+  binary: number;
+  /** 0 or 1. */
+  verifiable: number;
   ambiguity_notes?: string;
   [extra: string]: unknown;
 }

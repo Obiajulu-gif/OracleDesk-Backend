@@ -3,7 +3,8 @@
  *
  * Each shape is written once in zod. From it we derive:
  *   - `jsonSchema`   → Anthropic tool `input_schema` (forced tool use);
- *   - `geminiSchema` → Gemini `responseSchema` (an OpenAPI-subset dialect).
+ *   - `geminiSchema` → Gemini `responseSchema` (an OpenAPI-subset dialect);
+ *   - `openaiSchema` → OpenAI strict `json_schema` response format (#218).
  *
  * Zod features that have no JSON Schema form (`.catch`, `.default`,
  * transforms) stay out of the *wire* schemas; the lenient domain schemas that
@@ -18,6 +19,7 @@ import { z } from 'zod';
 
 export type JsonSchema = Record<string, any>;
 export type GeminiSchema = Record<string, any>;
+export type OpenAISchema = Record<string, any>;
 
 export interface StructuredSpec<T> {
   /** Tool name for Anthropic; also used in logs. */
@@ -26,6 +28,8 @@ export interface StructuredSpec<T> {
   zod: z.ZodType<T>;
   jsonSchema: JsonSchema;
   geminiSchema: GeminiSchema;
+  /** Strict-mode schema for OpenAI structured outputs (#218). */
+  openaiSchema: OpenAISchema;
   /** Cross-field rules. Returns an error message for the repair turn, or null. */
   postValidate?: (value: T) => string | null;
 }
@@ -40,7 +44,17 @@ export function defineStructured<T>(
   // slipped into a wire schema fails at module load, not at the provider.
   const jsonSchema = z.toJSONSchema(schema, { target: 'draft-7', io: 'input' }) as JsonSchema;
   delete jsonSchema.$schema;
-  return { name, description, zod: schema, jsonSchema, geminiSchema: toGeminiSchema(jsonSchema), postValidate };
+  // Like the Gemini dialect, the strict OpenAI form throws at module load
+  // when the shape cannot be expressed (#218).
+  return {
+    name,
+    description,
+    zod: schema,
+    jsonSchema,
+    geminiSchema: toGeminiSchema(jsonSchema),
+    openaiSchema: toOpenAIStrictSchema(jsonSchema),
+    postValidate,
+  };
 }
 
 const GEMINI_TYPES: Record<string, SchemaType> = {
@@ -114,6 +128,126 @@ export function toGeminiSchema(input: JsonSchema): GeminiSchema {
   }
 
   return out;
+}
+
+// ─── OpenAI strict json_schema (#218) ─────────────────────────────────────────
+
+/**
+ * Keywords kept in the strict schema. Deliberately small: strict mode answers
+ * 400 on keywords it does not support, and support for bounds (`minimum`,
+ * `maxItems`, `pattern`, ...) varies by model. Everything dropped is still
+ * enforced by zod after the call and reaches the model in the repair turn.
+ */
+export const OPENAI_STRICT_KEYWORDS = [
+  'type', 'description', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'anyOf',
+] as const;
+
+/** Strict mode limits nesting depth; deeper shapes are refused at definition time. */
+const OPENAI_MAX_DEPTH = 10;
+
+const OPENAI_TYPES = new Set(['object', 'string', 'number', 'integer', 'boolean', 'array', 'null']);
+
+/**
+ * Converts a draft-7 JSON Schema to OpenAI's strict `json_schema` subset:
+ * every object gets `additionalProperties: false` and lists every property in
+ * `required`; a property that was optional becomes `anyOf: [X, { type: 'null' }]`
+ * (the adapter turns those nulls back into absent keys before zod, see
+ * `dropOptionalNulls`). `const` becomes a one-value `enum`, a type array
+ * becomes `anyOf`, and keywords outside OPENAI_STRICT_KEYWORDS are dropped.
+ *
+ * Throws when a shape cannot be expressed strictly: a non-object root, a map
+ * (`additionalProperties` schema with no fixed properties), a missing type, or
+ * nesting deeper than strict mode accepts.
+ */
+export function toOpenAIStrictSchema(input: JsonSchema): OpenAISchema {
+  if (input.type !== 'object') throw new Error('OpenAI strict schemas need an object at the root');
+  return strictNode(input, 1);
+}
+
+function strictNode(schema: JsonSchema, depth: number): OpenAISchema {
+  if (depth > OPENAI_MAX_DEPTH) throw new Error(`OpenAI strict schemas cannot nest deeper than ${OPENAI_MAX_DEPTH} levels`);
+
+  if (Array.isArray(schema.anyOf)) {
+    const out: OpenAISchema = { anyOf: schema.anyOf.map((s: JsonSchema) => strictNode(s, depth)) };
+    if (schema.description) out.description = schema.description;
+    return out;
+  }
+  if (Array.isArray(schema.type)) {
+    const { type, ...rest } = schema;
+    return strictNode({ anyOf: (type as string[]).map((t) => ({ ...rest, type: t })), description: schema.description }, depth);
+  }
+  if (typeof schema.type !== 'string' || !OPENAI_TYPES.has(schema.type)) {
+    throw new Error(`Unsupported JSON Schema type for OpenAI strict mode: ${String(schema.type)}`);
+  }
+
+  const out: OpenAISchema = { type: schema.type };
+  if (schema.description) out.description = schema.description;
+  if (schema.const !== undefined) out.enum = [schema.const];
+  else if (Array.isArray(schema.enum)) out.enum = [...schema.enum];
+
+  if (schema.type === 'array') {
+    out.items = strictNode(schema.items ?? { type: 'string' }, depth + 1);
+  }
+
+  if (schema.type === 'object') {
+    const props: Record<string, JsonSchema> = schema.properties ?? {};
+    if (Object.keys(props).length === 0 && schema.additionalProperties && schema.additionalProperties !== false) {
+      throw new Error('OpenAI strict schemas cannot express a map with free-form keys');
+    }
+    const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
+    out.properties = Object.fromEntries(
+      Object.entries(props).map(([k, v]) => {
+        const node = strictNode(v, depth + 1);
+        return [k, required.has(k) ? node : nullable(node)];
+      }),
+    );
+    out.required = Object.keys(props);
+    out.additionalProperties = false;
+  }
+
+  for (const key of Object.keys(out)) {
+    if (!(OPENAI_STRICT_KEYWORDS as readonly string[]).includes(key)) delete out[key];
+  }
+  return out;
+}
+
+function nullable(node: OpenAISchema): OpenAISchema {
+  if (Array.isArray(node.anyOf)) {
+    return node.anyOf.some((s: OpenAISchema) => s.type === 'null') ? node : { ...node, anyOf: [...node.anyOf, { type: 'null' }] };
+  }
+  return { anyOf: [node, { type: 'null' }] };
+}
+
+/**
+ * Strict mode makes the model send `null` for a property that was optional in
+ * the wire schema; zod's `.optional()` rejects null. Deletes those keys
+ * (recursively, objects and arrays) so the value means what the model meant.
+ * Nulls the wire schema itself allows are kept. Returns a new value.
+ */
+export function dropOptionalNulls(schema: JsonSchema | undefined, value: unknown): unknown {
+  if (!schema || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(schema.anyOf)) {
+    const branch = schema.anyOf.find((s: JsonSchema) =>
+      Array.isArray(value) ? s.type === 'array' : s.type === 'object');
+    return dropOptionalNulls(branch, value);
+  }
+  if (Array.isArray(value)) {
+    return schema.type === 'array' ? value.map((v) => dropOptionalNulls(schema.items, v)) : value;
+  }
+  if (schema.type !== 'object') return value;
+  const props: Record<string, JsonSchema> = schema.properties ?? {};
+  const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v === null && !required.has(k) && props[k] && !allowsNull(props[k])) continue;
+    out[k] = dropOptionalNulls(props[k], v);
+  }
+  return out;
+}
+
+function allowsNull(schema: JsonSchema): boolean {
+  if (schema.type === 'null' || (Array.isArray(schema.type) && schema.type.includes('null'))) return true;
+  return Array.isArray(schema.anyOf) && schema.anyOf.some(allowsNull);
 }
 
 /** Formats zod issues for a repair turn. Never includes the model's raw output. */

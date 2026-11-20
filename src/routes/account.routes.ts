@@ -20,7 +20,7 @@ router.get('/devices', requireAuth, async (req: Request, res: Response) => {
 
 router.patch('/devices/:id', requireAuth, async (req: Request, res: Response) => {
   const userId = req.user!.userId;
-  const { id } = req.params;
+  const id = String(req.params.id);
   const { label } = req.body as { label?: unknown };
   if (typeof label !== 'string' || label.trim().length === 0) {
     return sendError(res, 400, 'VALIDATION_ERROR', 'label must be a non-empty string');
@@ -31,7 +31,7 @@ router.patch('/devices/:id', requireAuth, async (req: Request, res: Response) =>
 
 router.delete('/devices/:id', requireAuth, async (req: Request, res: Response) => {
   const userId = req.user!.userId;
-  const { id } = req.params;
+  const id = String(req.params.id);
   await revokeDevice(userId, id, 'USER_REVOKED');
   sendSuccess(res, { ok: true });
 });

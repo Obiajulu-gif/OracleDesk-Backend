@@ -10,6 +10,7 @@ import reportRoutes    from './reports.routes';
 import agentsRoutes    from './agents.routes';
 import accountRoutes   from './account.routes';
 import schemasRoutes   from './schemas.routes';
+import x402AllowanceRoutes from './x402-allowance.routes';
 import { noStore } from '../middlewares/cache.middleware';
 
 const router = Router();
@@ -33,5 +34,6 @@ router.use('/reports',   reportRoutes);
 router.use('/agents',    agentsRoutes);
 router.use('/account',   accountRoutes);
 router.use('/schemas',   schemasRoutes);
+router.use('/x402/allowance', x402AllowanceRoutes);
 
 export default router;

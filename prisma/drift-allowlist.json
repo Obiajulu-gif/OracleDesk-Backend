@@ -24,6 +24,14 @@
     "expires": null
   },
   {
+    "object": "chain_transactions_unhandled_idx",
+    "kind": "index",
+    "match": "chain_transactions_unhandled_idx",
+    "reason": "Partial covering index (status, updatedAt) INCLUDE (maxTime) WHERE handledAt IS NULL behind the outbox readiness probe; Prisma cannot express partial or INCLUDE indexes. Managed by raw SQL in 20261120110000_outbox_unhandled_index (#220).",
+    "issue": null,
+    "expires": null
+  },
+  {
     "object": "vector",
     "kind": "extension",
     "match": "CREATE EXTENSION",
